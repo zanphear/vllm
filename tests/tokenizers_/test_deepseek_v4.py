@@ -6,25 +6,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm.entrypoints.chat_utils import parse_chat_messages
-from vllm.entrypoints.openai.chat_completion.protocol import (
-    ChatCompletionRequest,
-    ChatMessage,
-)
-from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.renderers.registry import RENDERER_REGISTRY
 from vllm.tokenizers.deepseek_v4 import get_deepseek_v4_tokenizer
-from vllm.tokenizers.deepseek_v4_encoding import (
-    REASONING_EFFORT_PROMPTS,
-    encode_arguments_to_dsml,
-)
 from vllm.tokenizers.registry import TokenizerRegistry
-
-# Thinking defaults on and, when on, reasoning effort defaults to "high", so an
-# unqualified request now carries this preamble at message index 0. Tests below
-# reference the table rather than the wording: the tier is the contract.
-_DEFAULT_EFFORT_PREAMBLE = REASONING_EFFORT_PROMPTS["high"]
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "deepseek_v4"
 
@@ -127,134 +114,92 @@ def test_deepseek_v4_explicitly_disables_thinking(kwargs):
     assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>")
 
 
-def test_deepseek_v4_honors_official_thinking_request_field():
-    request = ChatCompletionRequest.model_validate(
-        {
-            "model": "deepseek-ai/DeepSeek-V4-Flash",
-            "messages": [{"role": "user", "content": "Hello"}],
-            "thinking": {"type": "enabled"},
-        }
-    )
-    chat_kwargs = request.apply_chat_template_kwargs(
-        request.build_chat_params(None, "auto").chat_template_kwargs
-    )
-
+@pytest.mark.parametrize(
+    ("enable_thinking", "thinking_token"),
+    [(False, "</think>"), (True, "<think>")],
+)
+def test_deepseek_v4_appends_assistant_transition_after_trailing_system(
+    enable_thinking, thinking_token
+):
     prompt = _tokenizer().apply_chat_template(
-        request.messages,
+        [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "system", "content": "Be concise."},
+        ],
         tokenize=False,
-        **chat_kwargs,
+        enable_thinking=enable_thinking,
+        reasoning_effort="low",
     )
 
-    assert chat_kwargs["thinking"] is True
-    assert chat_kwargs["enable_thinking"] is True
     assert prompt == (
-        "<｜begin▁of▁sentence｜>"
-        + _DEFAULT_EFFORT_PREAMBLE
-        + "<｜User｜>Hello<｜Assistant｜><think>"
+        "<｜begin▁of▁sentence｜>You are helpful."
+        f"<｜User｜>What is 2+2?Be concise.<｜Assistant｜>{thinking_token}"
     )
 
 
-def test_deepseek_v4_defaults_to_official_thinking_for_openai_request():
-    request = ChatCompletionRequest.model_validate(
-        {
-            "model": "deepseek-ai/DeepSeek-V4-Flash",
-            "messages": [{"role": "user", "content": "Hello"}],
-        }
-    )
-    chat_kwargs = request.apply_chat_template_kwargs(
-        request.build_chat_params(None, "auto").chat_template_kwargs
-    )
-
-    assert chat_kwargs["thinking"] is True
-    assert chat_kwargs["enable_thinking"] is True
-
-
-def test_deepseek_v4_preserves_official_reasoning_content_alias():
-    messages = [
-        {"role": "user", "content": "Q1"},
-        {"role": "assistant", "reasoning_content": "because", "content": "A1"},
-        {"role": "user", "content": "Q2"},
-    ]
-
-    conversation, _, _ = parse_chat_messages(
-        messages,
-        _model_config(),
-        content_format="string",
-    )
-
-    assert conversation[1]["reasoning"] == "because"
-    assert conversation[1]["reasoning_content"] == "because"
-
-
-def test_deepseek_v4_response_messages_expose_reasoning_content_alias():
-    message = ChatMessage(role="assistant", reasoning="because", content="answer")
-    delta = DeltaMessage(reasoning="because")
-
-    assert message.reasoning_content == "because"
-    assert delta.reasoning_content == "because"
-    assert (
-        ChatMessage(
-            role="assistant",
-            reasoning_content="because",
-            content="answer",
-        ).reasoning
-        == "because"
-    )
-
-
-def test_deepseek_v4_preserves_official_prefix_assistant_message():
-    messages = [
-        {"role": "user", "content": "Please write quick sort code"},
-        {"role": "assistant", "content": "```python\n", "prefix": True},
-    ]
-
-    conversation, _, _ = parse_chat_messages(
-        messages,
-        _model_config(),
-        content_format="string",
-    )
+def test_deepseek_v4_does_not_transition_after_mid_conversation_system():
     prompt = _tokenizer().apply_chat_template(
-        conversation=conversation,
-        messages=messages,
+        [
+            {"role": "user", "content": "What is 3+3?"},
+            {"role": "assistant", "content": "6"},
+            {"role": "system", "content": "Answer in French."},
+            {"role": "user", "content": "What is 5+5?"},
+        ],
         tokenize=False,
+        enable_thinking=False,
     )
 
-    assert conversation[1]["prefix"] is True
-    assert conversation[1]["wo_eos"] is True
-    # Thinking is on by default now, so the prefix turn opens and closes an
-    # empty thinking block before the prefix content instead of only closing one.
-    assert prompt.endswith("<｜Assistant｜><think></think>```python\n")
-    assert not prompt.endswith("<｜end▁of▁sentence｜>")
-
-
-def test_deepseek_v4_thinking_ignores_sampling_controls():
-    request = ChatCompletionRequest.model_validate(
-        {
-            "model": "deepseek-ai/DeepSeek-V4-Flash",
-            "messages": [{"role": "user", "content": "Hello"}],
-            "thinking": {"type": "enabled"},
-            "temperature": 0.2,
-            "top_p": 0.3,
-            "top_k": 4,
-            "presence_penalty": 1.5,
-            "frequency_penalty": 1.25,
-        }
-    )
-    chat_kwargs = request.apply_chat_template_kwargs(
-        request.build_chat_params(None, "auto").chat_template_kwargs
+    assert prompt == (
+        "<｜begin▁of▁sentence｜><｜User｜>What is 3+3?"
+        "<｜Assistant｜></think>6<｜end▁of▁sentence｜>"
+        "Answer in French.<｜User｜>What is 5+5?"
+        "<｜Assistant｜></think>"
     )
 
-    sampling_params = request.to_sampling_params(
-        16,
-        {},
-        chat_template_kwargs=chat_kwargs,
+
+@pytest.mark.parametrize(
+    ("enable_thinking", "expected"),
+    [
+        (
+            False,
+            "<｜begin▁of▁sentence｜>rules<｜Assistant｜></think>answer"
+            "<｜end▁of▁sentence｜>",
+        ),
+        (
+            True,
+            "<｜begin▁of▁sentence｜>rules<｜Assistant｜><think>reason</think>answer"
+            "<｜end▁of▁sentence｜>",
+        ),
+    ],
+)
+def test_deepseek_v4_transitions_from_system_to_assistant(enable_thinking, expected):
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {"role": "system", "content": "rules"},
+            {
+                "role": "assistant",
+                "reasoning": "reason",
+                "content": "answer",
+            },
+        ],
+        tokenize=False,
+        enable_thinking=enable_thinking,
+        reasoning_effort="low",
     )
 
-    assert sampling_params.temperature == 1.0
-    assert sampling_params.top_p == 1.0
-    assert sampling_params.top_k == 0
-    assert sampling_params.presence_penalty == 0.0
-    assert sampling_params.frequency_penalty == 0.0
+    assert prompt == expected
+
+
+def test_deepseek_v4_unknown_role_raises_value_error():
+    # Invalid roles are client errors: they must surface as ValueError
+    # (mapped to HTTP 400 by the OpenAI serving layer), not
+    # NotImplementedError (mapped to HTTP 501).
+    with pytest.raises(ValueError, match="Invalid role: SYSTEM"):
+        _tokenizer().apply_chat_template(
+            [{"role": "SYSTEM", "content": "Hello"}],
+            tokenize=False,
+        )
 
 
 def test_deepseek_v4_uses_v4_tool_prompt_from_request_tools():
@@ -345,66 +290,6 @@ def test_deepseek_v4_renders_parsed_history_tool_arguments():
     assert '<｜DSML｜parameter name="command" string="true">view' in prompt
     assert '<｜DSML｜parameter name="path" string="true">/testbed' in prompt
     assert 'parameter name="arguments"' not in prompt
-
-
-@pytest.mark.parametrize(
-    ("tool_call", "expected_parameter"),
-    [
-        ({"name": "refresh", "arguments": None}, None),
-        ({"name": "refresh"}, None),
-        ({"name": "refresh", "arguments": ""}, None),
-        (
-            {"name": "refresh", "arguments": '{"target": "cache"}'},
-            '<｜DSML｜parameter name="target" string="true">cache',
-        ),
-        (
-            {"name": "refresh", "arguments": {"target": "cache"}},
-            '<｜DSML｜parameter name="target" string="true">cache',
-        ),
-    ],
-)
-def test_deepseek_v4_encodes_empty_history_tool_arguments(
-    tool_call, expected_parameter
-):
-    prompt = encode_arguments_to_dsml(tool_call)
-
-    if expected_parameter is None:
-        assert prompt == ""
-    else:
-        assert expected_parameter in prompt
-
-
-def test_deepseek_v4_renders_openai_history_tool_call_with_null_arguments():
-    messages = [
-        {"role": "user", "content": "Refresh state"},
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "refresh",
-                        "arguments": None,
-                    },
-                }
-            ],
-        },
-    ]
-    conversation, _, _ = parse_chat_messages(
-        messages,
-        _model_config(),
-        content_format="string",
-    )
-
-    prompt = _tokenizer().apply_chat_template(
-        conversation=conversation,
-        messages=messages,
-        tokenize=False,
-    )
-
-    assert '<｜DSML｜invoke name="refresh">' in prompt
-    assert "<｜DSML｜parameter" not in prompt
 
 
 @pytest.mark.parametrize(
@@ -521,235 +406,225 @@ def test_deepseek_v4_matches_reference_golden_fixtures(case_id, kwargs):
     assert prompt == expected
 
 
+def test_deepseek_v4_rejects_empty_developer_content():
+    with pytest.raises(ValueError):
+        _tokenizer().apply_chat_template(
+            [{"role": "developer", "content": ""}],
+            tokenize=False,
+            enable_thinking=True,
+            reasoning_effort="low",
+        )
+
+
 @pytest.mark.parametrize(
-    "model",
+    "kwargs",
     [
-        "deepseek-ai/DeepSeek-V4-Flash",
-        "deepseek-ai/DeepSeek-V4-Pro",
+        {"thinking_mode": "bogus"},
+        {"thinking_mode": "thinking", "reasoning_effort": "turbo"},
     ],
 )
-def test_deepseek_v4_official_api_defaults_to_thinking_for_v4_family(model):
-    from vllm.entrypoints.openai.chat_completion.protocol import (
-        ChatCompletionRequest,
+def test_deepseek_v4_encode_messages_rejects_invalid_arguments(kwargs):
+    from vllm.tokenizers.deepseek_v4_encoding import encode_messages
+
+    with pytest.raises(ValueError):
+        encode_messages([{"role": "user", "content": "Hello"}], **kwargs)
+
+
+def test_deepseek_v4_image_blocks_become_placeholders():
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first:"},
+                    {"type": "image_url", "image_url": {"url": "file:///a.png"}},
+                    {"type": "text", "text": "second:"},
+                    {"type": "image", "source": {"data": "AAAA"}},
+                ],
+            }
+        ],
+        tokenize=False,
+        thinking=False,
     )
 
-    request = ChatCompletionRequest.model_validate(
-        {
-            "model": model,
-            "messages": [{"role": "user", "content": "Hello"}],
-        }
-    )
-    chat_kwargs = request.apply_chat_template_kwargs(
-        request.build_chat_params(None, "auto").chat_template_kwargs
-    )
-
-    assert chat_kwargs["thinking"] is True
-    assert chat_kwargs["enable_thinking"] is True
+    assert "<｜User｜>first:<｜deepseek_image｜>second:<｜deepseek_image｜>" in prompt
 
 
-def test_deepseek_v4_official_api_uses_model_config_for_family_detection():
-    from vllm.entrypoints.openai.chat_completion.protocol import (
-        ChatCompletionRequest,
+def test_deepseek_v4_image_sentinel_ids_match_tokenizer():
+    """The borrowed sentinel ids must line up with the reserved
+    ``<|place_holder_mm_span_XXXX|>`` tokens in the tokenizer."""
+    from vllm.models.deepseek_v4.common.mm_preprocess import (
+        IMAGE_SENTINEL_BASE_ID,
+        IMAGE_SENTINEL_TOKEN_NAMES,
+        image_sentinel_mask,
+        validate_image_sentinel_ids,
     )
 
-    request = ChatCompletionRequest.model_validate(
-        {
-            "model": "local-ds4-alias",
-            "messages": [{"role": "user", "content": "Hello"}],
-            "temperature": 0.2,
-        }
+    class FakeTokenizer:
+        def __init__(self, offset: int = 0) -> None:
+            self.offset = offset
+
+        def convert_tokens_to_ids(self, token: str) -> int:
+            return (
+                IMAGE_SENTINEL_BASE_ID
+                + self.offset
+                + (IMAGE_SENTINEL_TOKEN_NAMES.index(token))
+            )
+
+    validate_image_sentinel_ids(FakeTokenizer())  # no raise
+    with pytest.raises(ValueError, match="sentinel"):
+        validate_image_sentinel_ids(FakeTokenizer(offset=1))
+
+    ids = torch.tensor(
+        [
+            1,
+            IMAGE_SENTINEL_BASE_ID,
+            IMAGE_SENTINEL_BASE_ID + 4,
+            IMAGE_SENTINEL_BASE_ID + 5,
+            129264,
+        ]
     )
-    model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="deepseek_v4", architectures=[]),
-    )
-    chat_kwargs = request.apply_chat_template_kwargs(
-        request.build_chat_params(None, "auto").chat_template_kwargs,
-        model_config=model_config,
-    )
-
-    sampling_params = request.to_sampling_params(
-        16,
-        {},
-        chat_template_kwargs=chat_kwargs,
-        model_config=model_config,
-    )
-
-    assert chat_kwargs["thinking"] is True
-    assert chat_kwargs["enable_thinking"] is True
-    assert sampling_params.temperature == 1.0
+    assert image_sentinel_mask(ids).tolist() == [False, True, True, False, False]
 
 
-def test_deepseek_v4_official_api_sampling_override_can_be_disabled():
-    from vllm.entrypoints.openai.chat_completion.protocol import (
-        ChatCompletionRequest,
-    )
-
-    request = ChatCompletionRequest.model_validate(
-        {
-            "model": "deepseek-ai/DeepSeek-V4-Flash",
-            "messages": [{"role": "user", "content": "Hello"}],
-            "thinking": {"type": "enabled"},
-            "deepseek_v4_sampling_override": False,
-            "temperature": 0.2,
-            "top_p": 0.3,
-            "top_k": 4,
-            "min_p": 0.05,
-            "presence_penalty": 1.5,
-            "frequency_penalty": 1.25,
-        }
-    )
-    chat_kwargs = request.apply_chat_template_kwargs(
-        request.build_chat_params(None, "auto").chat_template_kwargs
-    )
-
-    sampling_params = request.to_sampling_params(
-        16,
-        {},
-        chat_template_kwargs=chat_kwargs,
-    )
-
-    assert sampling_params.temperature == 0.2
-    assert sampling_params.top_p == 0.3
-    assert sampling_params.top_k == 4
-    assert sampling_params.min_p == 0.05
-    assert sampling_params.presence_penalty == 1.5
-    assert sampling_params.frequency_penalty == 1.25
-
-
-def test_deepseek_v4_official_api_sampling_override_is_v4_only():
-    from vllm.entrypoints.openai.chat_completion.protocol import (
-        ChatCompletionRequest,
-    )
-
-    request = ChatCompletionRequest.model_validate(
-        {
-            "model": "deepseek-ai/DeepSeek-R1",
-            "messages": [{"role": "user", "content": "Hello"}],
-            "thinking": {"type": "enabled"},
-            "temperature": 0.2,
-            "top_p": 0.3,
-            "top_k": 4,
-            "min_p": 0.05,
-            "presence_penalty": 1.5,
-            "frequency_penalty": 1.25,
-        }
-    )
-    chat_kwargs = request.apply_chat_template_kwargs(
-        request.build_chat_params(None, "auto").chat_template_kwargs
-    )
-
-    sampling_params = request.to_sampling_params(
-        16,
-        {},
-        chat_template_kwargs=chat_kwargs,
-    )
-
-    assert "thinking" not in chat_kwargs
-    assert "enable_thinking" not in chat_kwargs
-    assert sampling_params.temperature == 0.2
-    assert sampling_params.top_p == 0.3
-    assert sampling_params.top_k == 4
-    assert sampling_params.min_p == 0.05
-    assert sampling_params.presence_penalty == 1.5
-    assert sampling_params.frequency_penalty == 1.25
-
-def _split_turn_messages():
-    """One logical assistant turn replayed as consecutive messages."""
+def _request_tools():
     return [
-        {"role": "user", "content": "Check the server"},
-        {"role": "assistant", "content": "Let me check the server status."},
-        {
-            "role": "assistant",
-            "reasoning": "The user wants a health check. I should run uptime.",
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "shell_exec",
-                        "arguments": '{"command": "uptime"}',
-                    },
-                }
-            ],
-        },
-        {
-            "role": "tool",
-            "tool_call_id": "call_1",
-            "content": "up 5 days",
-        },
-    ]
-
-
-def test_deepseek_v4_merges_consecutive_assistant_messages():
-    messages = _split_turn_messages()
-    tools = [
         {
             "type": "function",
             "function": {
-                "name": "shell_exec",
-                "description": "Run a shell command",
+                "name": "get_weather",
+                "description": "Get weather for a city",
                 "parameters": {
                     "type": "object",
-                    "properties": {"command": {"type": "string"}},
-                    "required": ["command"],
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
                 },
             },
         }
     ]
-    conversation, _, _ = parse_chat_messages(
-        messages,
-        _model_config(),
-        content_format="string",
-    )
+
+
+def _encode_reference(messages):
+    from vllm.tokenizers.deepseek_v4_encoding import encode_messages
+
+    return encode_messages(messages, thinking_mode="thinking", reasoning_effort="low")
+
+
+def test_deepseek_v4_attaches_request_tools_to_existing_system_message():
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Weather in Paris?"},
+    ]
 
     prompt = _tokenizer().apply_chat_template(
-        conversation=conversation,
-        messages=messages,
-        tools=tools,
+        messages,
+        tools=_request_tools(),
         tokenize=False,
         thinking=True,
+        reasoning_effort="low",
     )
 
-    # The split turn renders as one canonical turn:
-    # reasoning, then content, then tool calls.
-    assert (
-        "<｜Assistant｜><think>"
-        "The user wants a health check. I should run uptime."
-        "</think>Let me check the server status.\n\n<｜DSML｜tool_calls>"
-    ) in prompt
-    # No orphaned reasoning blocks: the only dangling <think> opener is the
-    # generation prompt.
-    assert prompt.count("<think>") - 1 == prompt.count("</think>")
-    # The merged turn ends with a single EOS.
-    assert prompt.count("<｜end▁of▁sentence｜>") == 1
-    assert prompt.endswith("<｜Assistant｜><think>")
-
-
-def test_deepseek_v4_merges_consecutive_assistant_messages_drop_thinking():
-    messages = _split_turn_messages()
-    conversation, _, _ = parse_chat_messages(
-        messages,
-        _model_config(),
-        content_format="string",
+    expected = _encode_reference(
+        [{**messages[0], "tools": _request_tools()}, messages[1]]
     )
+    assert prompt == expected
+    assert prompt.startswith("<｜begin▁of▁sentence｜>You are helpful.\n\n## Tools")
+    assert prompt.count("## Tools") == 1
+
+
+def test_deepseek_v4_synthetic_system_only_when_no_system_message():
+    """Without a system message, request tools still get a synthetic leading
+    system entry."""
+    messages = [{"role": "user", "content": "Weather in Paris?"}]
 
     prompt = _tokenizer().apply_chat_template(
-        conversation=conversation,
-        messages=messages,
+        messages,
+        tools=_request_tools(),
         tokenize=False,
         thinking=True,
+        reasoning_effort="low",
     )
 
-    # Without request tools, reasoning from earlier turns is dropped, but the
-    # split turn still renders as a single assistant turn (one EOS).
-    assert prompt == (
-        "<｜begin▁of▁sentence｜>"
-        + _DEFAULT_EFFORT_PREAMBLE
-        + "<｜User｜>Check the server<｜Assistant｜></think>"
-        "Let me check the server status.\n\n<｜DSML｜tool_calls>\n"
-        '<｜DSML｜invoke name="shell_exec">\n'
-        '<｜DSML｜parameter name="command" string="true">'
-        "uptime</｜DSML｜parameter>\n"
-        "</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜>"
-        "<｜User｜><tool_result>up 5 days</tool_result><｜Assistant｜><think>"
+    expected = _encode_reference(
+        [{"role": "system", "tools": _request_tools()}, messages[0]]
     )
+    assert prompt == expected
+    assert prompt.startswith("<｜begin▁of▁sentence｜>\n\n## Tools")
+
+
+def test_deepseek_v4_request_tools_override_system_message_tools():
+    message_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "message_level_tool",
+                "description": "Should not be rendered",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    system_message = {
+        "role": "system",
+        "content": "You are helpful.",
+        "tools": message_tools,
+    }
+    user_message = {"role": "user", "content": "Weather in Paris?"}
+
+    prompt = _tokenizer().apply_chat_template(
+        [system_message, user_message],
+        tools=_request_tools(),
+        tokenize=False,
+        thinking=True,
+        reasoning_effort="low",
+    )
+
+    expected = _encode_reference(
+        [{**system_message, "tools": _request_tools()}, user_message]
+    )
+    assert prompt == expected
+    assert '"name": "get_weather"' in prompt
+    assert "message_level_tool" not in prompt
+
+
+def test_deepseek_v4_attaches_request_tools_to_first_system_message_only():
+    """Only the first system message, at any index, gets the request tools."""
+    messages = [
+        {"role": "user", "content": "Hi"},
+        {"role": "system", "content": "First system."},
+        {"role": "system", "content": "Second system."},
+        {"role": "user", "content": "Weather in Paris?"},
+    ]
+
+    prompt = _tokenizer().apply_chat_template(
+        messages,
+        tools=_request_tools(),
+        tokenize=False,
+        thinking=True,
+        reasoning_effort="low",
+    )
+
+    expected = _encode_reference(
+        [
+            messages[0],
+            {**messages[1], "tools": _request_tools()},
+            messages[2],
+            messages[3],
+        ]
+    )
+    assert prompt == expected
+    assert "First system.\n\n## Tools" in prompt
+    assert prompt.count("## Tools") == 1
+
+
+def test_deepseek_v4_request_tools_do_not_mutate_caller_messages():
+    import copy
+
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Weather in Paris?"},
+    ]
+    snapshot = copy.deepcopy(messages)
+
+    _tokenizer().apply_chat_template(messages, tools=_request_tools(), tokenize=False)
+
+    assert messages == snapshot
