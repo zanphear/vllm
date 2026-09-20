@@ -50,14 +50,18 @@ DSML_INVOKE_END = f"</{_DSML}invoke>"
 DSML_PARAM_CLOSE = f"</{_DSML}parameter>"
 
 _ESCAPED_DSML = re.escape(_DSML)
+# The ``string`` attribute is optional: the model sometimes omits it, and
+# dropping such a parameter hands the client a tool call with no arguments
+# (upstream vllm-project/vllm#56271, adapted to this file's single dialect).
+# A missing attribute is treated like ``string="false"`` by the consumer.
+_PARAM_HEAD = rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
 _PARAM_RE = re.compile(
-    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
-    rf"(.*?)</{_ESCAPED_DSML}parameter>",
+    rf"{_PARAM_HEAD}(.*?)"
+    rf"(?:</{_ESCAPED_DSML}parameter>|(?=<{_ESCAPED_DSML}parameter\s+name=))",
     re.DOTALL,
 )
 _PARTIAL_PARAM_RE = re.compile(
-    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
-    rf"(.*)$",
+    rf"{_PARAM_HEAD}(.*)$",
     re.DOTALL,
 )
 
